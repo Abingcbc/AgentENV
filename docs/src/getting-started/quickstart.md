@@ -1,0 +1,93 @@
+# Quick Start
+
+## Prerequisites
+
+- **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04**
+- `/dev/kvm` access for Firecracker microVM execution
+
+The install script attempts to install missing download and checksum commands,
+provisions KVM permissions, loads the `ublk_drv` kernel module, and downloads
+all runtime assets on first run.
+
+Installation requires root, but the installed service does not run as root. It
+uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
+`CAP_SYS_ADMIN`, plus group access to `/dev/kvm` and the ublk devices.
+
+## Setup
+
+### 1. Install and start the server
+
+**Option A — Install Script (Linux x86_64)**
+
+Installs both the server and the `aenv` CLI, then starts the server as a systemd service:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh | sudo bash
+sudo systemctl start aenv
+```
+
+Set `AENV_HOME_PATH` to override the default `/var/lib/aenv` data directory.
+It contains aenv runtime dependencies and data.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh \
+  | sudo AENV_HOME_PATH=/path/to/aenv/data bash
+```
+
+To change the port, edit `API_ADDR` in `/etc/default/aenv` and restart the service.
+
+The service's persistent state is owned by `aenv` under `/var/lib/aenv` by
+default. Transient namespace and daemon-socket state lives under `/run/aenv`.
+
+**Option B — Docker**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
+docker pull ghcr.io/kvcache-ai/aenv-server:latest
+docker run --rm -it \
+  --device /dev/kvm --privileged -v /dev:/dev \
+  -p 8000:8000 \
+  ghcr.io/kvcache-ai/aenv-server:latest
+```
+
+To change the port, add the `-e API_ADDR` and `-p` flags.
+
+The server is accessible at `http://127.0.0.1:8000` by default. Verify it is running:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+### 2. Install the aenv CLI
+
+Skip this step if you used **Option A** — the install script already includes `aenv`.
+
+Supports Linux and macOS on x86_64 and arm64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
+```
+
+### 3. Authenticate
+
+```bash
+aenv auth
+# AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
+# API key: dummy
+```
+
+For local development, any non-empty string works as the API key.
+
+### 4. Pull a template and run a sandbox
+
+```bash
+aenv pull ubuntu:22.04 --name ubuntu
+aenv start ubuntu            # starts a sandbox and attaches an interactive shell
+```
+
+## Next Steps
+
+- [Deployment](../deployment/manual-compile.md) — build from source, multi-node options
+- [Core Concepts](../concepts/overview.md) — how sandboxes, templates, and snapshots work
+- [E2B SDK](../integration/e2b-sdk.md) — TypeScript integration
+- [API Reference](../api/index.md) — full HTTP API

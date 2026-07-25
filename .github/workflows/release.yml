@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-aenv:
+    name: Build aenv (${{ matrix.asset_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: ''
+            asset_name: aenv-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: ''
+            asset_name: aenv-linux-aarch64
+          - os: macos-15
+            target: x86_64-apple-darwin
+            asset_name: aenv-darwin-x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset_name: aenv-darwin-aarch64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev libprotobuf-dev protobuf-compiler
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build aenv
+        run: cargo build --release -p aenv ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          BIN=${{ matrix.target && format('target/{0}/release/aenv', matrix.target) || 'target/release/aenv' }}
+          cp "$BIN" dist/${{ matrix.asset_name }}
+          strip dist/${{ matrix.asset_name }} || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  build-server:
+    name: Build server (linux-x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev libprotobuf-dev protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build server binaries
+        run: |
+          cargo build --release -p agentenv --bin server
+          cargo build --release -p uvm-ublk-daemon
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist/bundle/ublk
+          cp target/release/server dist/bundle/server
+          strip dist/bundle/server
+          cp target/release/uvm-ublk-daemon dist/bundle/ublk/uvm-ublk-daemon
+          strip dist/bundle/ublk/uvm-ublk-daemon
+          cp config/default.toml dist/bundle/default.toml
+
+          STAGE_HOME="$PWD/dist/tmp-aenv"
+          STAGE_DEPS="$STAGE_HOME/deps"
+          mkdir -p "$STAGE_HOME"
+          AENV_HOME_PATH="$STAGE_HOME" dist/bundle/server --setup-only || {
+            echo "ERROR: --setup-only failed; check network and dependency downloads"
+            exit 1
+          }
+
+          test -d "$STAGE_DEPS" || {
+            echo "ERROR: deps dir missing at $STAGE_DEPS after --setup-only"
+            exit 1
+          }
+          test -f "$STAGE_DEPS/overlaybd/etc/overlaybd/overlaybd.json" || {
+            echo "ERROR: missing staged overlaybd default config after --setup-only"
+            exit 1
+          }
+          cp -a "$STAGE_DEPS" dist/bundle/deps
+          mkdir -p dist/bundle/etc/overlaybd
+          cp "$STAGE_DEPS/overlaybd/etc/overlaybd/overlaybd.json" dist/bundle/etc/overlaybd/overlaybd.json
+          rm -rf "$STAGE_HOME"
+          tar -czf dist/aenv-server-linux-x86_64.tar.gz -C dist/bundle .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-bundle
+          path: dist/aenv-server-linux-x86_64.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: [build-aenv, build-server]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: git-cliff
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5  # v4.8.0
+        with:
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGES.md
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: CHANGES.md
+          files: |
+            dist/aenv-linux-x86_64
+            dist/aenv-linux-aarch64
+            dist/aenv-darwin-x86_64
+            dist/aenv-darwin-aarch64
+            dist/aenv-server-linux-x86_64.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  docker-publish:
+    name: Build and push Docker images
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set lowercase owner
+        run: echo "OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.agentenv
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}
+            ghcr.io/${{ env.OWNER }}/aenv-server:latest

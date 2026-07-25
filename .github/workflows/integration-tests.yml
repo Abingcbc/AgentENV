@@ -1,0 +1,94 @@
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      log_level:
+        description: "Log level for the tests"
+        required: false
+  pull_request:
+    paths-ignore: &ignore_docs
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/benchmark.yml"
+      - ".github/workflows/e2b-benchmark.yml"
+      - ".github/workflows/docs.yml"
+      - ".github/workflows/coverage.yml"
+      - ".github/workflows/services-ci.yml"
+      - ".github/workflows/mutation-tests.yml"
+  push:
+    paths-ignore: *ignore_docs
+
+env:
+  RUST_LOG: ${{ github.event.inputs.log_level || 'info' }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  agentenv-tests:
+    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          ci_deps_target: ci-deps
+      - uses: ./.github/actions/sandbox-ci-setup
+        with:
+          ghcr_username: ${{ github.actor }}
+          ghcr_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: AgentEnv Integration tests
+        run: sg kvm -c "make test-agent-integration PROFILE=debug"
+      - uses: ./.github/actions/sandbox-artifacts-cleanup
+        if: always()
+
+  e2e-tests:
+    name: e2e-tests (${{ matrix.e2e_name }})
+    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - e2e_name: single-node
+            make_target: test-e2e
+          - e2e_name: docker-compose
+            make_target: test-e2e-compose
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-ci-setup
+        if: ${{ matrix.e2e_name == 'single-node' }}
+        with:
+          ci_deps_target: ci-deps
+      - uses: ./.github/actions/sandbox-ci-setup
+        if: ${{ matrix.e2e_name == 'single-node' }}
+        with:
+          ghcr_username: ${{ github.actor }}
+          ghcr_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure ublk test host
+        if: ${{ matrix.e2e_name != 'single-node' }}
+        run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Install e2b CLI
+        run: npm install -g @e2b/cli@2.8.1
+      - name: Install e2b Python SDK
+        run: python3 -m pip install --user e2b==2.14.1
+      - name: Install e2b-code-interpreter Python SDK
+        run: python3 -m pip install --user e2b-code-interpreter==2.6.0
+      - name: E2E tests (${{ matrix.e2e_name }})
+        run: |
+          if [[ "${{ matrix.e2e_name }}" == "single-node" ]]; then
+            sg kvm -c "make ${{ matrix.make_target }} PROFILE=debug"
+          else
+            make ${{ matrix.make_target }} PROFILE=debug
+          fi
+      - uses: ./.github/actions/sandbox-artifacts-cleanup
+        if: always()
