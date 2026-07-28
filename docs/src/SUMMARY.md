@@ -14,6 +14,7 @@
 - [Static Multi-Node (Without Kubernetes)](./deployment/static-multi-node.md)
 - [Kubernetes (Multi-Node)](./deployment/kubernetes.md)
 - [Manual Compile (Single Node)](./deployment/manual-compile.md)
+- [PVM Deployment (When KVM Is Unavailable)](./deployment/pvm.md)
 
 # Configuration
 

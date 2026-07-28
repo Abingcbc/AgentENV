@@ -21,6 +21,10 @@ For a real multi-machine deployment without Kubernetes, see
 - Docker and Docker Compose
 - `build-essential` (`sudo apt install -y build-essential`)
 
+The checked-in Compose setup uses standard KVM. If the host does not support
+it, read [PVM Deployment](./pvm.md) before adapting the runtime image and host
+configuration.
+
 ## Clone the Repository
 
 ```bash
