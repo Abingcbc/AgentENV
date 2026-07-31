@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use overlaybd::config::UpperMode;
+use shell_util::shell_quote;
 use tempfile::TempDir;
 use tokio::time::Instant;
-use tracing::{debug, Span};
+use tracing::{debug, warn, Span};
 
 use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
@@ -222,6 +223,7 @@ impl TemplateBuildRunner {
                         let build_context = step_executor
                             .execute(&sandbox, &steps, initial_context)
                             .await?;
+                        ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
                         run_startup_commands(&sandbox, startup.as_ref()).await?;
                         let runtime_versions = SnapshotRuntimeVersions::probe(&sandbox).await?;
@@ -257,6 +259,166 @@ impl TemplateBuildRunner {
             Ok(result) => result,
             Err(_) => bail!("snapshot build worker thread panicked"),
         }
+    }
+}
+
+/// Provision the template's default user when the image does not have it.
+///
+/// envd resolves operations against the template's default user. E2B Cloud
+/// guarantees the account exists through its base images, and the e2b SDK
+/// bakes that convention in: `from_dockerfile` injects `USER user` whenever a
+/// Dockerfile does not set one. Arbitrary OCI images do not ship that
+/// account, so every SDK filesystem call against the resulting sandbox fails
+/// at runtime with envd's "invalid default user". Creating the missing
+/// account at build time aligns template builds with what E2B-compatible
+/// clients assume.
+///
+/// Numeric USER values are left alone (Docker allows a UID with no passwd
+/// entry). An image with no account-management tooling at all (neither
+/// useradd/groupadd nor adduser/addgroup) keeps building with a warning
+/// rather than failing: such an image worked before this provisioning
+/// existed, and only envd calls that resolve the default user will fail.
+/// Any other failure aborts the build — a creation tool that is present but
+/// fails (permission denied, read-only filesystem, corrupt passwd database)
+/// leaves the template with a default identity known not to resolve, and
+/// executor errors (envd unreachable, sandbox gone) are infrastructure
+/// failures.
+///
+/// A `USER name:group` value names the account and the group independently
+/// (Docker resolves the two separately and requires no membership), so a
+/// missing named group is provisioned the same way as a missing account.
+async fn ensure_default_user(
+    sandbox: &impl SandboxExecutor,
+    build_context: &CommandContext,
+) -> Result<()> {
+    let Some(user) = build_context.user.as_deref() else {
+        return Ok(());
+    };
+    // USER may be "name", "uid", "name:group", or "uid:gid".
+    let (account, group) = match user.split_once(':') {
+        Some((account, group)) => (account.trim(), Some(group.trim())),
+        None => (user.trim(), None),
+    };
+
+    // The group first: if a future change binds the account to it (useradd
+    // -g), the group must already exist.
+    if let Some(group) = group {
+        ensure_entity(
+            sandbox,
+            ProvisionEntity {
+                kind: "group",
+                name: group,
+                exists_probe: "getent group",
+                create: "groupadd",
+                create_fallback: "addgroup",
+            },
+        )
+        .await?;
+    }
+    ensure_entity(
+        sandbox,
+        ProvisionEntity {
+            kind: "user",
+            name: account,
+            exists_probe: "id -u",
+            create: "useradd -m",
+            create_fallback: "adduser -D",
+        },
+    )
+    .await
+}
+
+/// One passwd/group entity the template's USER value names.
+struct ProvisionEntity<'a> {
+    kind: &'static str,
+    name: &'a str,
+    exists_probe: &'static str,
+    create: &'static str,
+    create_fallback: &'static str,
+}
+
+/// Bound on one provisioning command: the probes can wait on NSS providers
+/// and useradd/groupadd on passwd/group locks, and an unbounded hang here
+/// would wedge the build worker.
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Exit code the provisioning script reserves for "this image ships no
+/// account-management tooling" — the one failure that stays a warning.
+const PROVISION_MISSING_TOOLING_EXIT: i32 = 66;
+
+async fn ensure_entity(sandbox: &impl SandboxExecutor, entity: ProvisionEntity<'_>) -> Result<()> {
+    let ProvisionEntity {
+        kind,
+        name,
+        exists_probe,
+        create,
+        create_fallback,
+    } = entity;
+    if name.is_empty() || name == "root" || name.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(());
+    }
+    // Only provision names that are plausibly Unix accounts/groups; anything
+    // else (e.g. a value starting with "-") would be misparsed as options by
+    // the tools below, so leave it alone.
+    let mut chars = name.chars();
+    let valid_name = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    if !valid_name {
+        warn!(
+            entity = name,
+            kind, "template default {kind} is not a valid name; leaving it as-is"
+        );
+        return Ok(());
+    }
+
+    let quoted = shell_quote(name);
+    let create_bin = create.split_whitespace().next().unwrap_or(create);
+    let fallback_bin = create_fallback
+        .split_whitespace()
+        .next()
+        .unwrap_or(create_fallback);
+    // Dispatch on which creation tool the image ships instead of chaining
+    // fallbacks: a chained `useradd || adduser` would mask a real failure of
+    // the present tool behind the fallback's "command not found", and its
+    // exit code could not be told apart from "no tooling at all".
+    let script = format!(
+        "{exists_probe} {quoted} >/dev/null 2>&1 && exit 0; \
+         command -v {create_bin} >/dev/null 2>&1 && exec {create} {quoted}; \
+         command -v {fallback_bin} >/dev/null 2>&1 && exec {create_fallback} {quoted}; \
+         exit {PROVISION_MISSING_TOOLING_EXIT}"
+    );
+    // /bin/sh, not bash: the images most likely to be missing the entry
+    // (Alpine/BusyBox) are also the ones without bash, and the script is POSIX.
+    let opts = ProcessOpts::default().with_timeout(PROVISION_TIMEOUT);
+    let result = sandbox
+        .run_command_with_opts("/bin/sh", &["-c", &script], &opts)
+        .await;
+    match result {
+        Ok(output) if output.exit_code == 0 => Ok(()),
+        // An image with no account-management tooling built fine before this
+        // provisioning existed, so it keeps building; only envd calls that
+        // resolve the default user will fail at runtime.
+        Ok(output) if output.exit_code == PROVISION_MISSING_TOOLING_EXIT => {
+            warn!(
+                entity = name,
+                kind,
+                "image has neither {create_bin} nor {fallback_bin}; template default {kind} \
+                 left unprovisioned, and envd operations that resolve it will fail at runtime"
+            );
+            Ok(())
+        }
+        // A present tool that fails (permission denied, read-only filesystem,
+        // corrupt passwd database) leaves the template with a default identity
+        // known not to resolve — fail the build now rather than at every later
+        // SDK call against the published template.
+        Ok(output) => bail!(
+            "failed to provision template default {kind} {name}: exit status {}{}",
+            output.exit_code,
+            command_output_suffix(&output.stdout, &output.stderr)
+        ),
+        // Executor errors are infrastructure failures: envd unreachable,
+        // sandbox gone — those must fail the build too.
+        Err(error) => Err(error).with_context(|| format!("provision template default {kind}")),
     }
 }
 
@@ -458,7 +620,10 @@ mod tests {
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
 
-    use super::{prepare_startup, run_ready_command};
+    use super::{
+        ensure_default_user, prepare_startup, run_ready_command, PROVISION_MISSING_TOOLING_EXIT,
+        PROVISION_TIMEOUT,
+    };
     use crate::sandbox::{Executor, ProcessHandle, ProcessOpts, ProcessOutput, SandboxExecutor};
     use crate::snapshot::{CommandContext, StartupCommand};
 
@@ -546,6 +711,209 @@ mod tests {
             startup.context.env_vars.get("BASE").map(String::as_str),
             Some("1")
         );
+    }
+
+    /// Records the shell scripts the runner executes; reports a fixed exit code.
+    struct ScriptRecordingSandbox {
+        scripts: Mutex<Vec<String>>,
+        exit_code: i32,
+    }
+
+    impl ScriptRecordingSandbox {
+        fn with_exit_code(exit_code: i32) -> Self {
+            Self {
+                scripts: Mutex::new(Vec::new()),
+                exit_code,
+            }
+        }
+
+        fn scripts(&self) -> Vec<String> {
+            self.scripts
+                .lock()
+                .expect("scripts mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SandboxExecutor for ScriptRecordingSandbox {
+        fn executor(&self) -> Result<Executor<'_>> {
+            Err(anyhow!("not used by this test"))
+        }
+
+        async fn run_command_with_opts(
+            &self,
+            _cmd: &str,
+            args: &[&str],
+            _opts: &ProcessOpts,
+        ) -> Result<ProcessOutput> {
+            self.scripts
+                .lock()
+                .expect("scripts mutex should not be poisoned")
+                .push(args.last().unwrap_or(&"").to_string());
+            Ok(ProcessOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: self.exit_code,
+            })
+        }
+
+        async fn start_process(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _opts: &ProcessOpts,
+        ) -> Result<ProcessHandle> {
+            Err(anyhow!("not used by this test"))
+        }
+    }
+
+    fn context_with_user(user: Option<&str>) -> CommandContext {
+        CommandContext::default().with_user(user.map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_runs_under_a_bounded_timeout() {
+        let sandbox = RecordingSandbox {
+            timeouts: Mutex::new(Vec::new()),
+        };
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .unwrap();
+        let timeouts = sandbox
+            .timeouts
+            .lock()
+            .expect("timeouts mutex should not be poisoned")
+            .clone();
+        assert_eq!(timeouts, vec![Some(PROVISION_TIMEOUT)]);
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_skips_absent_root_and_numeric_users() {
+        for user in [None, Some("root"), Some("1000"), Some("1000:1000")] {
+            let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+            ensure_default_user(&sandbox, &context_with_user(user))
+                .await
+                .unwrap();
+            assert!(
+                sandbox.scripts().is_empty(),
+                "no provisioning should run for USER {user:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_creates_missing_named_user() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 1);
+        // shell_quote leaves safe account names bare and quotes the rest.
+        assert!(scripts[0].contains("id -u user"));
+        assert!(scripts[0].contains("useradd -m user"));
+        assert!(scripts[0].contains("adduser -D user"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_creates_the_named_group_too() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("app:staff")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 2);
+        // The group is provisioned first so a future account→group binding
+        // would find it, with the same probe-then-create fallbacks.
+        assert!(scripts[0].contains("getent group staff"));
+        assert!(scripts[0].contains("groupadd staff"));
+        assert!(scripts[0].contains("addgroup staff"));
+        assert!(scripts[1].contains("useradd -m app"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_leaves_numeric_gids_alone() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("app:1000")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("useradd -m app"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_skips_invalid_group_names() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("app:-g")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("useradd -m app"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_skips_invalid_account_names() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("-u")))
+            .await
+            .unwrap();
+        assert!(sandbox.scripts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_propagates_executor_errors() {
+        struct BrokenSandbox;
+
+        #[async_trait(?Send)]
+        impl SandboxExecutor for BrokenSandbox {
+            fn executor(&self) -> Result<Executor<'_>> {
+                Err(anyhow!("not used"))
+            }
+            async fn run_command_with_opts(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _opts: &ProcessOpts,
+            ) -> Result<ProcessOutput> {
+                Err(anyhow!("envd unreachable"))
+            }
+            async fn start_process(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _opts: &ProcessOpts,
+            ) -> Result<ProcessHandle> {
+                Err(anyhow!("not used"))
+            }
+        }
+
+        ensure_default_user(&BrokenSandbox, &context_with_user(Some("user")))
+            .await
+            .expect_err("infrastructure failures must fail the build");
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_without_tooling_warns_but_keeps_the_build() {
+        // An image without useradd/adduser built fine before provisioning
+        // existed; missing tooling must not turn it into a build failure.
+        let sandbox = ScriptRecordingSandbox::with_exit_code(PROVISION_MISSING_TOOLING_EXIT);
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .expect("missing tooling should not fail the build");
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_tool_failure_fails_the_build() {
+        // A present tool that fails (permission denied, read-only filesystem)
+        // leaves the template's default identity unresolvable — that must
+        // surface at build time, not at every later SDK call.
+        let sandbox = ScriptRecordingSandbox::with_exit_code(1);
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .expect_err("a failing creation tool must fail the build");
     }
 
     #[tokio::test]
