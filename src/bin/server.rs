@@ -76,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    config.sandbox.validate_access_token_hash_seed()?;
+
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
