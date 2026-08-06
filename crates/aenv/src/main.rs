@@ -33,26 +33,28 @@ enum Cmd {
     Upload(commands::upload::Args),
     /// Download a file from a sandbox
     Download(commands::download::Args),
+    /// Generate shell completion scripts
+    Completion(commands::completion::Args),
     /// Attach an interactive shell to a running sandbox
-    #[command(alias = "cn")]
+    #[command(visible_alias = "cn")]
     Connect(commands::connect::Args),
     /// Pause a running sandbox
     Pause(commands::pause::Args),
     /// Resume a paused sandbox
     Resume(commands::resume::Args),
     /// List sandboxes
-    #[command(alias = "ls")]
+    #[command(visible_alias = "ls")]
     List(commands::list::Args),
     /// Kill a sandbox
-    #[command(alias = "rm")]
+    #[command(visible_alias = "rm")]
     Delete(commands::delete::Args),
     /// Set the sandbox expiration (seconds from now)
     Timeout(commands::timeout::Args),
     /// Snapshot operations
-    #[command(alias = "snap")]
+    #[command(visible_alias = "snap")]
     Snapshot(commands::snapshot::Args),
     /// Template operations
-    #[command(alias = "templates")]
+    #[command(visible_alias = "templates")]
     Template(commands::template::Args),
 }
 
@@ -66,6 +68,7 @@ fn main() -> Result<()> {
         Cmd::Exec(a) => commands::exec::run(a),
         Cmd::Upload(a) => commands::upload::run(a),
         Cmd::Download(a) => commands::download::run(a),
+        Cmd::Completion(a) => commands::completion::run(a),
         Cmd::Connect(a) => commands::connect::run(a),
         Cmd::Pause(a) => commands::pause::run(a),
         Cmd::Resume(a) => commands::resume::run(a),
