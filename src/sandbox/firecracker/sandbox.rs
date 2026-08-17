@@ -1816,6 +1816,7 @@ impl FirecrackerSandbox {
                 drive.read_only(),
                 &runtime.image_config_path,
                 &snapshot_dir.join("drives").join(drive.drive_id()),
+                "drive",
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
