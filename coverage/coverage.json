@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "73.05%",
+    "missed": 1365,
+    "total": 5064
+  },
+  "generated_at": "2026-08-18T04:26:28Z",
+  "lines": {
+    "coverage": "77.33%",
+    "missed": 9520,
+    "total": 41998
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "76.50%",
+    "missed": 13848,
+    "total": 58931
+  },
+  "run_url": "https://github.com/Abingcbc/AgentENV/actions/runs/32097281628"
+}
