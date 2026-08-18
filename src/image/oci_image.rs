@@ -1455,11 +1455,44 @@ fn host_arch_to_oci(host_arch: &str) -> Result<&'static str> {
     }
 }
 
+/// OCI algorithm grammar: alphanumeric components joined by single `.`/`_`/`+`/`-`
+/// separators. Rejecting anything else keeps the value free of path separators,
+/// `..`, and other traversal payloads.
+fn is_valid_digest_algorithm(algo: &str) -> bool {
+    !algo.is_empty()
+        && algo.split(|c| matches!(c, '.' | '_' | '+' | '-')).all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
 fn blob_path_for_digest(layout_dir: &Path, digest: &str) -> Result<PathBuf> {
     let (algo, hex) = digest
         .split_once(':')
         .with_context(|| format!("malformed OCI digest: {digest}"))?;
-    Ok(layout_dir.join("blobs").join(algo).join(hex))
+
+    // `algo` and `hex` are taken verbatim from the registry-served manifest and
+    // are otherwise unvalidated (see fetch_manifest). Without the checks below,
+    // `Path::join` turns a hostile digest into an arbitrary host path: an
+    // absolute component such as `/etc:passwd` replaces the base entirely, and
+    // `sha256:../../../../root/.ssh/id_rsa` traverses out of the layout
+    // (CWE-22, GHSA-hw7r-gmc9-84jv F3). Constrain both components to the OCI
+    // digest grammar and confirm the joined path stays inside the blob store.
+    if !is_valid_digest_algorithm(algo)
+        || hex.is_empty()
+        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        bail!("refusing OCI digest with an unsafe algorithm or hex component: {digest}");
+    }
+
+    let blob_root = layout_dir.join("blobs");
+    let blob_path = blob_root.join(algo).join(hex);
+    if !blob_path.starts_with(&blob_root) {
+        bail!("OCI blob path for digest {digest} escapes the layout directory");
+    }
+    Ok(blob_path)
 }
 
 fn uuid_from_layer_digest(digest: &str) -> Uuid {
@@ -1567,6 +1600,21 @@ mod tests {
     fn blob_path_for_digest_rejects_malformed_digest() {
         let layout = Path::new("/tmp/oci");
         assert!(blob_path_for_digest(layout, "no-colon-here").is_err());
+    }
+
+    #[test]
+    fn blob_path_for_digest_rejects_traversal_and_absolute_components() {
+        let layout = Path::new("/tmp/oci");
+        // Absolute algorithm component would replace the base via Path::join.
+        assert!(blob_path_for_digest(layout, "/etc:passwd").is_err());
+        // `..` / separators in the hex component.
+        assert!(blob_path_for_digest(layout, "sha256:../../../../root/.ssh/id_rsa").is_err());
+        assert!(blob_path_for_digest(layout, "sha256:ab/cd").is_err());
+        // Separators in the algorithm component.
+        assert!(blob_path_for_digest(layout, "sha256/..:abcd").is_err());
+        // A well-formed digest still resolves under the blob store.
+        let ok = blob_path_for_digest(layout, "sha256:0123456789abcdef").unwrap();
+        assert!(ok.starts_with("/tmp/oci/blobs"));
     }
 
     #[test]
