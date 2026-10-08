@@ -2317,7 +2317,7 @@ mod tests {
         });
         let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
         fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
-        fs::write(layout.join("blobs/sha256/manifestA"), &manifest_bytes).unwrap();
+        fs::write(layout.join("blobs/sha256/aa01"), &manifest_bytes).unwrap();
 
         let index_json = serde_json::json!({
             "schemaVersion": 2,
@@ -2325,7 +2325,7 @@ mod tests {
             "manifests": [
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:manifestA",
+                    "digest": "sha256:aa01",
                     "size": manifest_bytes.len() as u64,
                 }
             ]
@@ -2367,8 +2367,8 @@ mod tests {
         });
         let amd_bytes = serde_json::to_vec(&amd_manifest).unwrap();
         let arm_bytes = serde_json::to_vec(&arm_manifest).unwrap();
-        fs::write(layout.join("blobs/sha256/amdManifest"), &amd_bytes).unwrap();
-        fs::write(layout.join("blobs/sha256/armManifest"), &arm_bytes).unwrap();
+        fs::write(layout.join("blobs/sha256/a0d64"), &amd_bytes).unwrap();
+        fs::write(layout.join("blobs/sha256/a2a64"), &arm_bytes).unwrap();
 
         let index_json = serde_json::json!({
             "schemaVersion": 2,
@@ -2376,13 +2376,13 @@ mod tests {
             "manifests": [
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:amdManifest",
+                    "digest": "sha256:a0d64",
                     "size": amd_bytes.len() as u64,
                     "platform": {"architecture": "amd64", "os": "linux"}
                 },
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:armManifest",
+                    "digest": "sha256:a2a64",
                     "size": arm_bytes.len() as u64,
                     "platform": {"architecture": "arm64", "os": "linux"}
                 }
@@ -2409,9 +2409,9 @@ mod tests {
 
         for level in 0..=MAX_INDEX_RESOLUTION_DEPTH {
             let next_digest = if level == MAX_INDEX_RESOLUTION_DEPTH {
-                "sha256:finalManifest".to_string()
+                "sha256:f1a1".to_string()
             } else {
-                format!("sha256:index{level}")
+                format!("sha256:1de{level:x}")
             };
             let media_type = if level == MAX_INDEX_RESOLUTION_DEPTH {
                 "application/vnd.oci.image.manifest.v1+json"
@@ -2429,14 +2429,14 @@ mod tests {
                 }]
             });
             fs::write(
-                layout.join(format!("blobs/sha256/index{level}")),
+                layout.join(format!("blobs/sha256/1de{level:x}")),
                 serde_json::to_vec(&nested).unwrap(),
             )
             .unwrap();
         }
 
         fs::write(
-            layout.join("blobs/sha256/finalManifest"),
+            layout.join("blobs/sha256/f1a1"),
             serde_json::to_vec(&serde_json::json!({
                 "schemaVersion": 2,
                 "config": {"digest": "sha256:config"},
@@ -2453,7 +2453,7 @@ mod tests {
                 "mediaType": "application/vnd.oci.image.index.v1+json",
                 "manifests": [{
                     "mediaType": "application/vnd.oci.image.index.v1+json",
-                    "digest": "sha256:index0",
+                    "digest": "sha256:1de0",
                     "size": 1,
                     "platform": {"architecture": "amd64", "os": "linux"}
                 }]
