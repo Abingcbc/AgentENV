@@ -5,21 +5,21 @@
     "total": 0
   },
   "functions": {
-    "coverage": "73.05%",
-    "missed": 1365,
-    "total": 5064
+    "coverage": "77.39%",
+    "missed": 1548,
+    "total": 6848
   },
-  "generated_at": "2026-08-18T04:26:28Z",
+  "generated_at": "2026-10-19T01:24:11Z",
   "lines": {
-    "coverage": "77.33%",
-    "missed": 9520,
-    "total": 41998
+    "coverage": "81.23%",
+    "missed": 10865,
+    "total": 57870
   },
   "package": "workspace",
   "regions": {
-    "coverage": "76.50%",
-    "missed": 13848,
-    "total": 58931
+    "coverage": "79.79%",
+    "missed": 16824,
+    "total": 83248
   },
-  "run_url": "https://github.com/Abingcbc/AgentENV/actions/runs/32097281628"
+  "run_url": "https://github.com/Abingcbc/AgentENV/actions/runs/39183161076"
 }
